@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# n8n 1-click installer (interactive) — domain REQUIRED
-# Ubuntu 22.04/24.04; Docker + PostgreSQL + Traefik(HTTPS) + systemd
+# n8n 1-click installer (interactive, domain-only)
+# Ubuntu 22.04/24.04 • Docker + PostgreSQL + Traefik(HTTPS) + systemd
 set -euo pipefail
 
 N8N_VERSION=${N8N_VERSION:-"latest"}
@@ -22,20 +22,16 @@ check_os() {
 
 ask_inputs() {
   read -rp "Домен для n8n (A-запись на IP сервера): " N8N_DOMAIN
-  while [[ -z "${N8N_DOMAIN}" ]]; do
-    read -rp "Пусто. Введи домен: " N8N_DOMAIN
-  done
+  while [[ -z "${N8N_DOMAIN}" ]]; do read -rp "Пусто. Введи домен: " N8N_DOMAIN; done
   read -rp "Email для Let's Encrypt: " LETSENCRYPT_EMAIL
-  while [[ -z "${LETSENCRYPT_EMAIL}" ]]; do
-    read -rp "Пусто. Введи email: " LETSENCRYPT_EMAIL
-  done
+  while [[ -z "${LETSENCRYPT_EMAIL}" ]]; do read -rp "Пусто. Введи email: " LETSENCRYPT_EMAIL; done
 }
 
-need_tools() {
+install_needed_tools() {
   local need=()
   for b in curl dig openssl ss; do command -v "$b" >/dev/null || need+=("$b"); done
   if ((${#need[@]})); then
-    log "Ставлю утилиты: ${need[*]}..."
+    log "Ставлю утилиты: ${need[*]}…"
     apt-get update -y
     apt-get install -y dnsutils openssl iproute2 curl
   fi
@@ -49,9 +45,9 @@ check_dns_points_here() {
   log "Проверяю DNS домена ${N8N_DOMAIN}…"
   local server_ip domain_ip
   server_ip=$(get_public_ip)
-  [[ -n "$server_ip" ]] || { warn "Не получил публичный IP сервера — пропущу строгую проверку"; return 0; }
+  [[ -n "$server_ip" ]] || { warn "Не получил публичный IP сервера — пропускаю строгую проверку"; return 0; }
   domain_ip=$(dig +short A "${N8N_DOMAIN}" | tail -n1)
-  [[ -n "$domain_ip" ]] || { err "A-запись для ${N8N_DOMAIN} не найдена. Создай её → ${server_ip}"; exit 1; }
+  [[ -n "$domain_ip" ]] || { err "A-запись для ${N8N_DOMAIN} не найдена. Укажи её на IP: ${server_ip}"; exit 1; }
   if [[ "$domain_ip" != "$server_ip" ]]; then
     err "Сейчас ${N8N_DOMAIN} → ${domain_ip}, а сервер → ${server_ip}. Обнови A-запись и повтори."
     exit 1
@@ -59,10 +55,10 @@ check_dns_points_here() {
   log "DNS ок: ${N8N_DOMAIN} → ${domain_ip}"
 }
 
-check_ports() {
+check_ports_free() {
   log "Проверяю порты 80/443…"
   if ss -tulpn 2>/dev/null | grep -E ':(80|443)\s' >/dev/null; then
-    err "Порт(ы) 80/443 уже заняты (nginx/apache/другой прокси). Отключи их и запусти скрипт снова."
+    err "Порт(ы) 80/443 заняты (nginx/apache/другой прокси). Отключи их и запусти снова."
     exit 1
   fi
 }
@@ -84,13 +80,16 @@ $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list
   systemctl enable --now docker
 }
 
-create_user_dirs() {
+create_users_dirs() {
   log "Создаю пользователя и директории…"
   id -u n8n >/dev/null 2>&1 || useradd --system --home "${N8N_DATA_DIR}" --shell /usr/sbin/nologin n8n
-  mkdir -p "${N8N_DATA_DIR}"/{data,postgres,traefik}
+  mkdir -p "${N8N_DATA_DIR}"/{data,postgres,traefik,dynamic}
   touch "${N8N_DATA_DIR}/traefik/acme.json"
   chmod 600 "${N8N_DATA_DIR}/traefik/acme.json"
-  chown -R n8n:n8n "${N8N_DATA_DIR}"
+  # Владелец для n8n-контейнера (UID 1000) — КЛЮЧЕВОЙ фикс
+  chown -R 1000:1000 "${N8N_DATA_DIR}/data"
+  # Остальное может принадлежать системному пользователю
+  chown -R n8n:n8n "${N8N_DATA_DIR}/postgres" "${N8N_DATA_DIR}/traefik" "${N8N_DATA_DIR}/dynamic" || true
 }
 
 gen_secret() { openssl rand -base64 48 | tr -d '\n' | tr -d '=+/'; }
@@ -107,6 +106,9 @@ WEBHOOK_URL=https://${N8N_DOMAIN}
 POSTGRES_USER=n8n
 POSTGRES_PASSWORD=$(gen_secret)
 POSTGRES_DB=n8n
+# Рекомендуемые флаги
+N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+N8N_RUNNERS_ENABLED=true
 EOF
   chown n8n:n8n "${N8N_DATA_DIR}/.env"
 }
@@ -121,6 +123,8 @@ services:
     restart: unless-stopped
     command:
       - "--providers.docker=true"
+      - "--providers.file.directory=/dynamic"
+      - "--providers.file.watch=true"
       - "--entrypoints.web.address=:80"
       - "--entrypoints.websecure.address=:443"
       - "--certificatesresolvers.le.acme.email=${LETSENCRYPT_EMAIL}"
@@ -133,6 +137,7 @@ services:
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
       - "./traefik:/letsencrypt"
+      - "./dynamic:/dynamic:ro"
     labels:
       - "traefik.enable=true"
 
@@ -164,28 +169,21 @@ services:
       - db
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.n8n.rule=Host(\`${N8N_DOMAIN}\`)"
-      - "traefik.http.routers.n8n.entrypoints=websecure"
-      - "traefik.http.routers.n8n.tls.certresolver=le"
+      # HTTP -> HTTPS
       - "traefik.http.routers.n8n-web.rule=Host(\`${N8N_DOMAIN}\`)"
       - "traefik.http.routers.n8n-web.entrypoints=web"
       - "traefik.http.routers.n8n-web.middlewares=redirect@file"
+      # HTTPS
+      - "traefik.http.routers.n8n.rule=Host(\`${N8N_DOMAIN}\`)"
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.routers.n8n.tls.certresolver=le"
 YML
-  # маленький middleware для редиректа http->https
-  mkdir -p "${N8N_DATA_DIR}/traefik/dynamic"
-  cat > "${N8N_DATA_DIR}/traefik/dynamic/redirect.toml" <<'TOML'
+
+  # middleware redirect@file (file provider)
+  cat > "${N8N_DATA_DIR}/dynamic/redirect.toml" <<'TOML'
 [http.middlewares.redirect.redirectScheme]
 scheme = "https"
 TOML
-}
-
-add_traefik_file_provider() {
-  # добавляем провайдер файлов для Traefik
-  sed -i '/--providers.docker=true/a \      - "--providers.file.directory=/dynamic"\n      - "--providers.file.watch=true"' \
-    "${N8N_DATA_DIR}/docker-compose.yml"
-  # примонтируем папку dynamic
-  sed -i '/\.\/traefik:\/letsencrypt"/a \      - ".\/traefik\/dynamic:\/dynamic:ro"' \
-    "${N8N_DATA_DIR}/docker-compose.yml"
 }
 
 write_systemd() {
@@ -218,8 +216,9 @@ start_stack() {
 
 print_summary() {
   echo
-  log "ГОТОВО ✅ Открой: https://${N8N_DOMAIN}"
+  log "ГОТОВО ✅  Открой: https://${N8N_DOMAIN}"
   echo "Директория: ${N8N_DATA_DIR}"
+  echo
   echo "Полезные команды:"
   echo "  sudo systemctl status n8n-compose"
   echo "  sudo systemctl restart n8n-compose"
@@ -232,17 +231,15 @@ main() {
   require_root
   check_os
   ask_inputs
-  need_tools
+  install_needed_tools
   check_dns_points_here
-  check_ports
+  check_ports_free
   install_docker
-  create_user_dirs
+  create_users_dirs
   write_env
   write_compose
-  add_traefik_file_provider
-  chown -R n8n:n8n "${N8N_DATA_DIR}"
-  write_systemd
   start_stack
+  write_systemd
   print_summary
 }
 
