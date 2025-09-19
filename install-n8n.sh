@@ -1,276 +1,223 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+# n8n 1-click installer with Traefik (HTTPS), www-domain support and port auto-fix
+# OS: Ubuntu 22.04/24.04 (root)
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Красивые сообщения
-# ────────────────────────────────────────────────────────────────────────────────
-GREEN="\033[32m"; YELLOW="\033[33m"; RED="\033[31m"; GRAY="\033[90m"; RESET="\033[0m"
-info()    { echo -e "${GREEN}[+]${RESET} $*"; }
-warn()    { echo -e "${YELLOW}[!]${RESET} $*"; }
-err()     { echo -e "${RED}[x]${RESET} $*"; }
-note()    { echo -e "${GRAY}—${RESET} $*"; }
+set -u
+export DEBIAN_FRONTEND=noninteractive
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || { err "Не найдено: $1"; exit 1; }
+# ---------- helpers ----------
+green() { printf "\e[32m%s\e[0m\n" "$*"; }
+yellow(){ printf "\e[33m%s\e[0m\n" "$*"; }
+red()   { printf "\e[31m%s\e[0m\n" "$*"; }
+die()   { red "[!] $*"; exit 1; }
+
+need_root() {
+  if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    die "Запусти скрипт от root (sudo -i)."
+  fi
 }
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Проверка ОС
-# ────────────────────────────────────────────────────────────────────────────────
-if ! grep -qi 'ubuntu' /etc/os-release; then
-  warn "Скрипт тестировался на Ubuntu 22.04/24.04. Продолжаем на свой риск."
-fi
+ask_input() {
+  read -rp "Домен для n8n (A-запись на IP сервера): " DOMAIN
+  DOMAIN=$(echo "$DOMAIN" | tr '[:upper:]' '[:lower:]' | sed -E 's#^https?://##; s#/$##')
+  [ -z "$DOMAIN" ] && die "Домен не может быть пустым."
+  read -rp "Email для Let's Encrypt: " EMAIL
+  [ -z "$EMAIL" ] && die "Email не может быть пустым."
+}
 
-if [[ $EUID -ne 0 ]]; then
-  err "Запусти от root: sudo -i"
-  exit 1
-fi
+server_ip_guess() {
+  # стараемся получить внешний IP
+  if ! SERVER_IP=$(curl -fsS https://api.ipify.org 2>/dev/null); then
+    SERVER_IP=$(hostname -I | awk '{print $1}')
+  fi
+  [ -z "$SERVER_IP" ] && SERVER_IP="(не удалось определить)"
+}
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Ввод данных
-# ────────────────────────────────────────────────────────────────────────────────
-read -rp "Домен для n8n (А-запись на этот сервер): " DOMAIN
-read -rp "Email для Let's Encrypt: " LETSENCRYPT_EMAIL
+dns_warn_if_mismatch() {
+  yellow "[i] Проверяю DNS домена $DOMAIN…"
+  RESOLVE_MAIN=$(getent ahosts "$DOMAIN" | awk '/STREAM/ {print $1; exit}')
+  RESOLVE_WWW=$(getent ahosts "www.$DOMAIN" | awk '/STREAM/ {print $1; exit}')
 
-if [[ -z "${DOMAIN}" || -z "${LETSENCRYPT_EMAIL}" ]]; then
-  err "Домен и email обязательны."
-  exit 1
-fi
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Проверка DNS → IP сервера
-# ────────────────────────────────────────────────────────────────────────────────
-note "Проверяю DNS домена ${DOMAIN}…"
-SERVER_IP="$(curl -4s https://api.ipify.org || curl -4s https://ifconfig.me || true)"
-
-resolve_a() {
-  # стараемся обойти нестандартную резолвинг-среду
-  if command -v dig >/dev/null 2>&1; then
-    dig +short A "${DOMAIN}" @1.1.1.1 | head -n1
+  if [ -n "$RESOLVE_MAIN" ]; then
+    green "[+] $DOMAIN -> $RESOLVE_MAIN"
   else
-    getent ahostsv4 "${DOMAIN}" | awk '{print $1}' | head -n1
+    yellow "[i] Не удалось разрешить $DOMAIN (возможно, DNS ещё не обновился)."
+  fi
+
+  if [ -n "$RESOLVE_WWW" ]; then
+    green "[+] www.$DOMAIN -> $RESOLVE_WWW"
+  else
+    yellow "[i] Не удалось разрешить www.$DOMAIN (не обязательно, просто предупреждение)."
+  fi
+
+  if [ "$SERVER_IP" != "(не удалось определить)" ] && [ -n "$RESOLVE_MAIN" ] && [ "$RESOLVE_MAIN" != "$SERVER_IP" ]; then
+    yellow "[i] Внимание: A-запись $DOMAIN указывает на $RESOLVE_MAIN, а сервер считает свой IP $SERVER_IP."
   fi
 }
 
-DOMAIN_IP="$(resolve_a)"
-
-if [[ -z "${DOMAIN_IP}" ]]; then
-  warn "Не удалось получить A-запись домена. Продолжаю без строгой проверки."
-else
-  info "DNS ок: ${DOMAIN} → ${DOMAIN_IP}"
-  if [[ -n "${SERVER_IP}" && "${DOMAIN_IP}" != "${SERVER_IP}" ]]; then
-    warn "A-запись домена (${DOMAIN_IP}) не совпадает с публичным IP сервера (${SERVER_IP})."
-    read -rp "Продолжить? [y/N]: " CONT
-    [[ "${CONT:-n}" =~ ^[Yy]$ ]] || exit 1
-  fi
-fi
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Освобождение портов 80/443 (умная очистка)
-# ────────────────────────────────────────────────────────────────────────────────
-ensure_ports_free() {
-  local ports=("80" "443")
-  local p
-  for p in "${ports[@]}"; do
-    if ss -ltn "( sport = :$p )" | tail -n +2 | grep -q .; then
-      warn "Порт ${p} занят — попробую освободить."
-      # 1) Популярные веб-сервера
-      local svc
-      for svc in nginx apache2 httpd caddy; do
-        if systemctl is-active --quiet "${svc}"; then
-          note "Останавливаю ${svc}…"
-          systemctl stop "${svc}" || true
-          systemctl disable "${svc}" >/dev/null 2>&1 || true
-          systemctl mask "${svc}" >/dev/null 2>&1 || true
-        fi
-      done
-      # 2) Контейнеры Docker, слушающие порт
-      if command -v docker >/dev/null 2>&1; then
-        local ids
-        ids="$(docker ps --format '{{.ID}} {{.Ports}}' \
-            | awk -vp=":${p}->" 'index($0,p){print $1}')"
-        if [[ -n "${ids}" ]]; then
-          note "Останавливаю контейнеры Docker на порту ${p}: ${ids}"
-          docker stop ${ids} || true
-        fi
-      fi
-      # 3) Если всё ещё занят — убиваем процесс
-      if ss -ltn "( sport = :$p )" | tail -n +2 | grep -q .; then
-        local pid
-        pid="$(ss -ltnp "( sport = :$p )" \
-              | awk 'NR>1{print $NF}' \
-              | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' \
-              | head -n1)"
-        if [[ -n "${pid}" ]]; then
-          warn "Порт ${p} держит PID ${pid}. Попробовать прибить процесс? Это безопасно."
-          read -rp "Убить PID ${pid}? [y/N]: " KILLIT
-          if [[ "${KILLIT:-n}" =~ ^[Yy]$ ]]; then
-            kill "${pid}" || true
-            sleep 1
-            kill -9 "${pid}" || true
-          else
-            err "Порт ${p} занят — не могу продолжить."
-            exit 1
-          fi
-        fi
-      fi
-      # финальная проверка
-      if ss -ltn "( sport = :$p )" | tail -n +2 | grep -q .; then
-        err "Не удалось освободить порт ${p}."
-        exit 1
-      else
-        info "Порт ${p} свободен."
-      fi
-    else
-      info "Порт ${p} свободен."
+free_ports_80_443() {
+  yellow "[i] Проверяю занятость портов 80/443…"
+  for svc in nginx apache2 httpd caddy; do
+    if systemctl is-active --quiet "$svc"; then
+      yellow "[i] Останавливаю сервис $svc…"
+      systemctl stop "$svc" || true
+      systemctl disable "$svc" || true
     fi
   done
+
+  # убиваем процессы, слушающие 80/443
+  fuser -k 80/tcp  2>/dev/null || true
+  fuser -k 443/tcp 2>/dev/null || true
 }
-ensure_ports_free
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Установка Docker + compose plugin
-# ────────────────────────────────────────────────────────────────────────────────
-info "Ставлю Docker…"
-apt-get update -y
-apt-get install -y ca-certificates curl gnupg lsb-release
-install -m 0755 -d /etc/apt/keyrings
-if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-  chmod a+r /etc/apt/keyrings/docker.gpg
-fi
-ARCH="$(dpkg --print-architecture)"
-CODENAME="$(. /etc/os-release; echo "$VERSION_CODENAME")"
-echo \
-  "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${CODENAME} stable" \
-  > /etc/apt/sources.list.d/docker.list
-apt-get update -y
-apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+install_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    yellow "[i] Устанавливаю Docker…"
+    apt-get update -y
+    apt-get install -y ca-certificates curl gnupg lsb-release
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+      | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+      https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+      > /etc/apt/sources.list.d/docker.list
+    apt-get update -y
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  fi
 
-systemctl enable --now docker
-info "Docker установлен."
+  if ! command -v docker >/dev/null 2>&1; then
+    die "Docker не установлен."
+  fi
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Каталоги стека
-# ────────────────────────────────────────────────────────────────────────────────
-STACK_DIR="/opt/n8n"
-mkdir -p "${STACK_DIR}/traefik/letsencrypt"
-mkdir -p "${STACK_DIR}/n8n"
-touch "${STACK_DIR}/traefik/letsencrypt/acme.json"
-chmod 600 "${STACK_DIR}/traefik/letsencrypt/acme.json"
+  # docker compose plugin
+  if ! docker compose version >/dev/null 2>&1; then
+    die "Не найден docker compose plugin."
+  fi
+}
 
-# ────────────────────────────────────────────────────────────────────────────────
-# .env и docker-compose.yml
-# ────────────────────────────────────────────────────────────────────────────────
-cat > "${STACK_DIR}/.env" <<EOF
+prepare_dirs() {
+  mkdir -p /opt/n8n/traefik
+  touch /opt/n8n/traefik/acme.json
+  chmod 600 /opt/n8n/traefik/acme.json
+}
+
+open_firewall() {
+  if command -v ufw >/dev/null 2>&1; then
+    if ufw status | grep -q "Status: active"; then
+      yellow "[i] Открываю 80/443 в UFW…"
+      ufw allow 80/tcp || true
+      ufw allow 443/tcp || true
+    fi
+  fi
+}
+
+write_env() {
+  cat > /opt/n8n/.env <<EOF
 DOMAIN=${DOMAIN}
-LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL}
+EMAIL=${EMAIL}
 EOF
+}
 
-cat > "${STACK_DIR}/docker-compose.yml" <<'EOF'
-version: "3.9"
-
+write_compose() {
+  cat > /opt/n8n/docker-compose.yml <<'EOF'
 services:
   traefik:
-    image: traefik:v3.0
+    image: traefik:v2.11
+    container_name: traefik
+    restart: unless-stopped
     command:
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
-      - --certificatesresolvers.le.acme.tlschallenge=true
-      - --certificatesresolvers.le.acme.email=${LETSENCRYPT_EMAIL}
-      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
-      - --log.level=INFO
+      - --certificatesresolvers.letsencrypt.acme.email=${EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+      - --api.dashboard=true
     ports:
       - "80:80"
       - "443:443"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./traefik/letsencrypt:/letsencrypt
+      - ./traefik/acme.json:/letsencrypt/acme.json
     networks:
-      - proxy
-    restart: unless-stopped
+      - web
 
   n8n:
     image: n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
     environment:
-      - N8N_HOST=${DOMAIN}
-      - N8N_PROTOCOL=https
-      - WEBHOOK_URL=https://${DOMAIN}/
       - N8N_PORT=5678
-      # полезное поведение при рестартах
+      - N8N_PROTOCOL=https
+      - N8N_HOST=${DOMAIN}
+      - WEBHOOK_URL=https://${DOMAIN}/
       - GENERIC_TIMEZONE=Europe/Moscow
+      - TZ=Europe/Moscow
     labels:
       - "traefik.enable=true"
-      # HTTPS-роутер
-      - "traefik.http.routers.n8n.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.n8n.rule=Host(`${DOMAIN}`, `www.${DOMAIN}`)"
       - "traefik.http.routers.n8n.entrypoints=websecure"
-      - "traefik.http.routers.n8n.tls.certresolver=le"
+      - "traefik.http.routers.n8n.tls=true"
+      - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
       - "traefik.http.services.n8n.loadbalancer.server.port=5678"
-      # HTTP→HTTPS редирект
-      - "traefik.http.middlewares.redirect2https.redirectscheme.scheme=https"
-      - "traefik.http.routers.n8n-plain.rule=Host(`${DOMAIN}`)"
-      - "traefik.http.routers.n8n-plain.entrypoints=web"
-      - "traefik.http.routers.n8n-plain.middlewares=redirect2https"
+      # редирект HTTP -> HTTPS
+      - "traefik.http.routers.n8n-redirect.rule=Host(`${DOMAIN}`, `www.${DOMAIN}`)"
+      - "traefik.http.routers.n8n-redirect.entrypoints=web"
+      - "traefik.http.routers.n8n-redirect.middlewares=redirect-to-https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
     volumes:
-      - ./n8n:/home/node/.n8n
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      - traefik
     networks:
-      - proxy
-    restart: unless-stopped
+      - web
+
+volumes:
+  n8n_data:
 
 networks:
-  proxy:
-    name: n8n-proxy
+  web:
+    external: false
 EOF
+}
 
-# ────────────────────────────────────────────────────────────────────────────────
-# UFW (если включён)
-# ────────────────────────────────────────────────────────────────────────────────
-if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
-  info "Открываю порты в ufw (80,443)…"
-  ufw allow 80/tcp || true
-  ufw allow 443/tcp || true
-fi
+up_stack() {
+  (cd /opt/n8n && docker compose pull && docker compose up -d)
+}
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Запуск стека
-# ────────────────────────────────────────────────────────────────────────────────
-( cd "${STACK_DIR}" && docker compose pull )
-( cd "${STACK_DIR}" && docker compose up -d )
+print_summary() {
+  cat <<MSG
 
-# ────────────────────────────────────────────────────────────────────────────────
-# systemd unit для автозапуска
-# ────────────────────────────────────────────────────────────────────────────────
-cat > /etc/systemd/system/n8n-stack.service <<EOF
-[Unit]
-Description=n8n + Traefik Stack (Docker Compose)
-After=network-online.target docker.service
-Wants=docker.service
+$(green "[✔] Установка завершена.")
+Домен:      $(green "$DOMAIN")
+Панель n8n: https://$DOMAIN/
 
-[Service]
-Type=oneshot
-WorkingDirectory=${STACK_DIR}
-RemainAfterExit=yes
-ExecStart=/usr/bin/docker compose up -d
-ExecStop=/usr/bin/docker compose down
-TimeoutStartSec=0
+Полезные команды:
+  cd /opt/n8n
+  docker compose logs -f traefik
+  docker compose logs -f n8n
+  docker compose restart n8n
 
-[Install]
-WantedBy=multi-user.target
-EOF
+Если сертификат не выпустился сразу — проверь, что A-запись домена указывает на IP сервера ($SERVER_IP),
+и подожди пару минут — Traefik попробует снова.
 
-systemctl daemon-reload
-systemctl enable --now n8n-stack.service
+MSG
+}
 
-info "Готово!"
-echo
-echo -e "Открой: ${GREEN}https://${DOMAIN}${RESET}"
-echo -e "Папка со стеком: ${GRAY}${STACK_DIR}${RESET}"
-echo
-echo "Обновить n8n до последней версии:"
-echo -e "  cd ${STACK_DIR} && docker compose pull && docker compose up -d"
-echo
-echo "Удалить всё (осторожно!):"
-echo -e "  systemctl stop n8n-stack && cd ${STACK_DIR} && docker compose down -v && rm -rf ${STACK_DIR}"
+# ---------- flow ----------
+need_root
+ask_input
+server_ip_guess
+dns_warn_if_mismatch
+free_ports_80_443
+install_docker
+prepare_dirs
+open_firewall
+write_env
+write_compose
+up_stack
+print_summary
